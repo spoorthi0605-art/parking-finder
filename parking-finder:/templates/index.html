@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Parking Spot Finder — Modal Result</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <h2>Parking Spot Finder</h2>
+
+    <label>Search (address/road/ground/place):</label>
+    <input id="searchPlace" placeholder="e.g., 'MG Road Bangalore' or 'Central Ground'">
+    <button id="searchBtn">Search</button>
+
+    <div style="margin-top:12px">
+      <button id="locBtn">Use My Current Location (click to search)</button>
+    </div>
+
+    <hr>
+
+    <h3>Report a Parking Spot</h3>
+    <p class="hint">Provide address OR click map to autofill coordinates (address optional).</p>
+    <label>Address (optional):</label>
+    <input id="addr" placeholder="Address or landmark (optional)">
+    <label>Latitude (optional):</label>
+    <input id="lat" placeholder="Click map or type">
+    <label>Longitude (optional):</label>
+    <input id="lng" placeholder="Click map or type">
+    <label>Status:</label>
+    <select id="status">
+      <option value="free">Free</option>
+      <option value="occupied">Occupied</option>
+    </select>
+    <button id="reportBtn">Submit Report</button>
+
+    <p id="info" style="color:#333"></p>
+  </div>
+
+  <!-- CENTERED MODAL (B1) -->
+  <div id="resultModal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <span id="modalClose" class="close">&times;</span>
+      <h2>Parking Availability Result</h2>
+      <div id="modalBody">
+        <!-- filled by JS -->
+      </div>
+    </div>
+  </div>
+
+<script>
+const map = L.map('map').setView([12.9716,77.5946],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+let spotMarkers = [], userMarker = null, recMarker = null;
+const greenIcon = L.icon({iconUrl:'https://maps.gstatic.com/mapfiles/ms2/micons/green-dot.png', iconSize:[28,28]});
+const redIcon   = L.icon({iconUrl:'https://maps.gstatic.com/mapfiles/ms2/micons/red-dot.png', iconSize:[28,28]});
+const yellowIcon= L.icon({iconUrl:'https://maps.gstatic.com/mapfiles/ms2/micons/yellow-dot.png', iconSize:[34,34]});
+const blueIcon  = L.icon({iconUrl:'https://maps.gstatic.com/mapfiles/ms2/micons/blue-dot.png', iconSize:[28,28]});
+
+// helpers
+function crowdLevel(reports){ if(reports<=2) return "Low"; if(reports<=5) return "Medium"; return "High"; }
+function estimateWait(status, reports){ if(status==="free") return 0; let base=6; let extra = reports*4; return Math.min(240, Math.round(base+extra)); }
+
+async function loadSpots(){
+  const res = await fetch('/spots');
+  const spots = await res.json();
+  spotMarkers.forEach(m=>map.removeLayer(m)); spotMarkers = [];
+  spots.forEach(s=>{
+    const icon = s.status==='free'?greenIcon:redIcon;
+    const m = L.marker([s.latitude,s.longitude],{icon}).addTo(map);
+    const cl = crowdLevel(s.reports);
+    const wait = estimateWait(s.status,s.reports);
+    const addr = s.address || 'No address provided';
+    m.bindPopup(`<b>${addr}</b><br>Status: <b>${s.status}</b><br>Reports: ${s.reports} (${cl})<br>Est wait: ${wait} min`);
+    spotMarkers.push(m);
+  });
+}
+loadSpots();
+setInterval(loadSpots,4000);
+
+// map click -> autofill + reverse geocode
+map.on('click', async (e)=>{
+  const lat = e.latlng.lat.toFixed(6), lon = e.latlng.lng.toFixed(6);
+  document.getElementById('lat').value = lat;
+  document.getElementById('lng').value = lon;
+  try{
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}`;
+    const r = await fetch(url); const j = await r.json();
+    if(j && j.display_name) document.getElementById('addr').value = j.display_name;
+  }catch(err){ console.log('reverse fail',err); }
+});
+
+// report submit (address optional)
+document.getElementById('reportBtn').addEventListener('click', async ()=>{
+  let addr = document.getElementById('addr').value.trim() || null;
+  let latVal = document.getElementById('lat').value.trim();
+  let lonVal = document.getElementById('lng').value.trim();
+  if((!latVal || !lonVal) && addr){
+    // geocode address
+    try{
+      const geourl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addr)}&limit=1`;
+      const r = await fetch(geourl); const arr = await r.json();
+      if(arr && arr.length>0){ latVal = arr[0].lat; lonVal = arr[0].lon; }
+      else { alert('Could not geocode address - please click map or type coordinates'); return; }
+    }catch(err){ alert('Geocode failed'); return; }
+  }
+  if(!latVal||!lonVal){ alert('Provide address OR lat/lon'); return; }
+  const payload = { latitude: parseFloat(latVal), longitude: parseFloat(lonVal), status: document.getElementById('status').value, address: addr };
+  await fetch('/spots', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  document.getElementById('info').innerText = 'Report submitted';
+  loadSpots();
+});
+
+// SEARCH flow - used by typed address and current location action
+async function performSearchAt(lat, lon, label){
+  // clear previous rec marker
+  if(recMarker) { map.removeLayer(recMarker); recMarker = null; }
+  map.setView([lat,lon],15);
+  const nearRes = await fetch(`/near?lat=${lat}&lon=${lon}&radius=1.0`);
+  const nearSpots = await nearRes.json();
+
+  // Build modal content
+  const modal = document.getElementById('resultModal');
+  const body = document.getElementById('modalBody');
+  body.innerHTML = ''; // clear
+  const titleP = document.createElement('p');
+  titleP.innerHTML = `<b>Search Location:</b> ${label}`;
+  body.appendChild(titleP);
+
+  if(nearSpots.length === 0){
+    const p = document.createElement('p'); p.innerText = 'No parking spots found within 1 km of this location.';
+    body.appendChild(p);
+    showModal();
+    return;
+  }
+
+  let freeCount = 0, occCount=0;
+  nearSpots.forEach(s=>{ if(s.status==='free') freeCount++; else occCount++; });
+  const total = nearSpots.length;
+
+  // recommended free (closest free)
+  let recommended = nearSpots.find(s=> s.status==='free') || null;
+  // compute aggregated crowd
+  let totalReports = 0; nearSpots.forEach(s=> totalReports += s.reports);
+  const avgReports = totalReports / Math.max(1, total);
+  const aggCrowd = avgReports <=2 ? 'Low' : (avgReports <=5 ? 'Medium' : 'High');
+
+  let waitText='N/A';
+  if(recommended) waitText = '0 min (free)';
+  else waitText = `${Math.min(240, Math.round(6 + nearSpots[0].reports*4))} min (estimated)`;
+
+  // summary block
+  const summary = document.createElement('div');
+  summary.innerHTML = `<b>Available:</b> ${freeCount>0 ? '✅ YES' : '❌ NO'} <br>
+                       <b>Nearest free spot:</b> ${recommended ? Math.round(recommended.distance_km*1000)+' m' : (Math.round(nearSpots[0].distance_km*1000)+' m (nearest)')}<br>
+                       <b>Crowd Level:</b> ${aggCrowd}<br>
+                       <b>Estimated Waiting Time:</b> ${waitText}<br>
+                       <b>Total spots within 1 km:</b> ${total} (Free: ${freeCount}, Occupied: ${occCount})`;
+  body.appendChild(summary);
+
+  // recommended spot details
+  if(recommended){
+    const recDiv = document.createElement('div'); recDiv.style.marginTop='8px';
+    recDiv.innerHTML = `<b>Recommended Spot Address:</b> ${recommended.address ? recommended.address : 'No address'} <br>Distance: ${Math.round(recommended.distance_km*1000)} m`;
+    body.appendChild(recDiv);
+    recMarker = L.marker([recommended.latitude, recommended.longitude], {icon: yellowIcon}).addTo(map);
+    recMarker.bindPopup('Recommended free spot').openPopup();
+  } else {
+    // highlight nearest occupied
+    const nearest = nearSpots[0];
+    const recDiv = document.createElement('div'); recDiv.style.marginTop='8px';
+    recDiv.innerHTML = `<b>Nearest Spot (occupied):</b> ${nearest.address ? nearest.address : 'No address'} <br>Distance: ${Math.round(nearest.distance_km*1000)} m`;
+    body.appendChild(recDiv);
+    recMarker = L.marker([nearest.latitude, nearest.longitude], {icon: redIcon}).addTo(map);
+    recMarker.bindPopup('Nearest occupied spot').openPopup();
+  }
+
+  // list top 4 nearby
+  const listDiv = document.createElement('pre'); listDiv.style.marginTop='10px';
+  let listText = 'Top nearby spots:\n';
+  nearSpots.slice(0,6).forEach((s,i)=> {
+    listText += `${i+1}. ${s.address ? s.address : 'No addr'} — ${s.status.toUpperCase()} — ${s.reports} reports — ${Math.round(s.distance_km*1000)} m\n`;
+  });
+  listDiv.innerText = listText;
+  body.appendChild(listDiv);
+
+  showModal();
+}
+
+// modal handlers
+function showModal(){ document.getElementById('resultModal').style.display = 'block'; }
+function hideModal(){ document.getElementById('resultModal').style.display = 'none'; }
+document.getElementById('modalClose').onclick = hideModal;
+window.onclick = function(event){ if(event.target === document.getElementById('resultModal')) hideModal(); }
+
+// search by typed address
+document.getElementById('searchBtn').addEventListener('click', async ()=>{
+  const q = document.getElementById('searchPlace').value.trim();
+  if(!q){ alert('Enter address/road/place to search'); return; }
+  try{
+    const geourl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(q)}&limit=3`;
+    const r = await fetch(geourl); const arr = await r.json();
+    if(!arr || arr.length === 0){ alert('Place not found'); return; }
+    const pick = arr[0];
+    const lat = parseFloat(pick.lat), lon = parseFloat(pick.lon);
+    performSearchAt(lat, lon, pick.display_name || q);
+  }catch(err){ alert('Geocode failed'); }
+});
+
+// current location only when clicked
+document.getElementById('locBtn').addEventListener('click', ()=>{
+  if(!navigator.geolocation){ alert('Geolocation not supported'); return; }
+  navigator.geolocation.getCurrentPosition(async (pos)=>{
+    const lat = pos.coords.latitude, lon = pos.coords.longitude;
+    if(userMarker) map.removeLayer(userMarker);
+    userMarker = L.marker([lat, lon], {icon: blueIcon}).addTo(map).bindPopup('You are here').openPopup();
+    performSearchAt(lat, lon, 'Your current location');
+  }, err => { alert('Geolocation failed: ' + err.message); }, {enableHighAccuracy:true});
+});
+</script>
+</body>
+</html>
